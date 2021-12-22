@@ -3,93 +3,95 @@ from numba import njit
 
 
 FLOAT_PRECISION = 1e-4
-@njit
+@njit(fastmath=True)
 def correct_patch_aspect(initial_x_patch, initial_y_patch):
+    TARGET_RATIO=1/4
     #determine if square
-    is_square = _patch_is_rectangular_check(initial_x_patch, initial_y_patch)
+    is_square = patch_is_rectangular(initial_x_patch, initial_y_patch)
     #coordinates are square check
     if is_square:
-        new_x_coordinates, new_y_coordinates = _quadrilateral_aspect_ratio_correction(initial_x_patch, initial_y_patch)
+        new_x_coordinates, new_y_coordinates = correct_square_aspect_ratio(initial_x_patch, initial_y_patch,
+                                                TARGET_RATIO=TARGET_RATIO)
     else:
-        new_x_coordinates, new_y_coordinates = _quadrilateral_aspect_ratio_correction(initial_x_patch,initial_y_patch)
+        new_x_coordinates, new_y_coordinates = correct_quadrilateral_aspect_ratio(initial_x_patch,initial_y_patch,
+                                                TARGET_RATIO=TARGET_RATIO)
     return new_x_coordinates, new_y_coordinates
 
-@njit
-def _quadrilateral_aspect_ratio_correction(initial_x_patch,initial_y_patch):
+
+
+@njit(fastmath=True)
+def correct_quadrilateral_aspect_ratio(initial_x_patch,initial_y_patch,TARGET_RATIO=1/4):
     """
     corrects a coordinate_modified patch to ensure the aspect ratio is at least 1:4
     """
-    x_midpoint_bottom = np.sum(initial_x_patch[:,0])/2
-    x_midpoint_top    = np.sum(initial_x_patch[:,1])/2
+    ADJUST_RATIO = TARGET_RATIO + TARGET_RATIO**3
+    midpoint_top    = np.asarray([np.sum(initial_x_patch[:,1]), np.sum(initial_y_patch[:,1])])/2
+    midpoint_bottom = np.asarray([np.sum(initial_x_patch[:,0]), np.sum(initial_y_patch[:,0])])/2
+    midpoint_left   = np.asarray([np.sum(initial_x_patch[0,:]), np.sum(initial_y_patch[0,:])])/2
+    midpoint_right  = np.asarray([np.sum(initial_x_patch[1,:]), np.sum(initial_y_patch[1,:])])/2
 
-    x_midpoint_left   = np.sum(initial_x_patch[0,:])/2
-    x_midpoint_right  = np.sum(initial_x_patch[1,:])/2
+    x_dir_delta = midpoint_right-midpoint_left
+    y_dir_delta = midpoint_top-midpoint_bottom
 
-    y_midpoint_bottom = np.sum(initial_y_patch[:,0])/2
-    y_midpoint_top    = np.sum(initial_y_patch[:,1])/2
+    horizontal_distance = np.sqrt(x_dir_delta[0]*x_dir_delta[0] + x_dir_delta[1]*x_dir_delta[1])
+    vertical_distance   = np.sqrt(y_dir_delta[0]*y_dir_delta[0] + y_dir_delta[1]*y_dir_delta[1])
 
-    y_midpoint_left   = np.sum(initial_y_patch[0,:])/2
-    y_midpoint_right  = np.sum(initial_y_patch[1,:])/2
-
-    x_horizontal_delta = x_midpoint_left-x_midpoint_right
-    y_horizontal_delta = y_midpoint_left-y_midpoint_right
-
-    x_vertical_delta   = x_midpoint_top-x_midpoint_bottom
-    y_vertical_delta   = y_midpoint_top-y_midpoint_bottom
-
-
-    horizontal_distance = np.sqrt( x_horizontal_delta*x_horizontal_delta + \
-                                   y_horizontal_delta*y_horizontal_delta)
-
-    vertical_distance   = np.sqrt( x_horizontal_delta*x_horizontal_delta + \
-                                   y_horizontal_delta*y_horizontal_delta)
-
-    aspect_ratio_flag = _aspect_ratio_exceeds_criteria(horizontal_distance, vertical_distance)
-
+    aspect_ratio_flag = aspect_ratio_exceeds_criteria(horizontal_distance, vertical_distance,
+                                                        TARGET_RATIO=TARGET_RATIO)
     new_x_coordinates = initial_x_patch.copy()
     new_y_coordinates = initial_y_patch.copy()
 
-    if aspect_ratio_flag==1:
-        delta_y  = _get_max_coordinate_diff(initial_y_patch)
-        new_x_coordinates[0,0] = -vertical_distance/8 + x_midpoint_bottom
-        new_x_coordinates[1,0] =  vertical_distance/8 + x_midpoint_bottom
-        new_x_coordinates[0,1] = -vertical_distance/8 + x_midpoint_top
-        new_x_coordinates[1,1] =  vertical_distance/8 + x_midpoint_top
-    elif aspect_ratio_flag==2:
-        delta_x  = _get_max_coordinate_diff(initial_x_patch)
-        new_y_coordinates[0,0] = -horizontal_distance/8 + y_midpoint_left
-        new_y_coordinates[1,0] =  horizontal_distance/8 + y_midpoint_right
-        new_y_coordinates[0,1] = -horizontal_distance/8 + y_midpoint_left
-        new_y_coordinates[1,1] =  horizontal_distance/8 + y_midpoint_right
+    ratio = horizontal_distance/vertical_distance
+    coordinate_adjust_x, coordinate_adjust_y = _correct_coordinates(horizontal_distance, vertical_distance,
+                                                                    aspect_ratio_flag,ADJUST_RATIO)
+    new_x_coordinates+=coordinate_adjust_x
+    new_y_coordinates+=coordinate_adjust_y
     return new_x_coordinates, new_y_coordinates
 
-@njit
-def _correct_square_aspect_ratio(initial_x_patch,initial_y_patch):
+@njit(fastmath=True)
+def correct_square_aspect_ratio(initial_x_patch,initial_y_patch,TARGET_RATIO=1/4):
     """
     returns a modified patch which has an aspect ratio of at most 1:4
     using 2d coordinate grids which have been determined are rectangular
 
     """
-    max_diff_x = _get_max_coordinate_diff(initial_x_patch)
-    max_diff_y = _get_max_coordinate_diff(initial_y_patch)
-    aspect_ratio_flag = _aspect_ratio_exceeds_criteria(max_diff_x, max_diff_y)
+    max_diff_x = get_max_coordinate_diff(initial_x_patch)
+    max_diff_y = get_max_coordinate_diff(initial_y_patch)
+    aspect_ratio_flag = aspect_ratio_exceeds_criteria(max_diff_x, max_diff_y,TARGET_RATIO=TARGET_RATIO)
     new_x_coordinates = initial_x_patch.copy()
     new_y_coordinates = initial_y_patch.copy()
-    if aspect_ratio_flag==1:
-        delta_y  = _get_max_coordinate_diff(initial_y_patch)
-        x_center = np.mean(initial_x_patch)
-        new_x_coordinates[0,:] = x_center - delta_y/8
-        new_x_coordinates[1,:] = x_center + delta_y/8
-    elif aspect_ratio_flag==2:
-        delta_x  = _get_max_coordinate_diff(initial_x_patch)
-        y_center = np.mean(initial_y_patch)
-        new_y_coordinates[0,:] = y_center - delta_x/8
-        new_y_coordinates[1,:] = y_center + delta_x/8
+
+    coordinate_adjust_x, coordinate_adjust_y = _correct_coordinates(max_diff_x, max_diff_y, 
+                                                 aspect_ratio_flag,TARGET_RATIO=TARGET_RATIO)
+   
+    new_x_coordinates+=coordinate_adjust_x
+    new_y_coordinates+=coordinate_adjust_y
+
     return new_x_coordinates, new_y_coordinates
 
 
-@njit
-def _aspect_ratio_exceeds_criteria(diff_x, diff_y, aspect_exceedence=1/4):
+@njit(fastmath=True)
+def _correct_coordinates(max_diff_x, max_diff_y, aspect_ratio_flag, TARGET_RATIO=1/4):
+    ratio = max_diff_x/max_diff_y
+    coordinate_adjust_x= np.zeros((2,2))
+    coordinate_adjust_y= np.zeros((2,2))
+    if aspect_ratio_flag==0:
+        return coordinate_adjust_x, coordinate_adjust_y
+    if aspect_ratio_flag==1:
+        delta = max_diff_y*(TARGET_RATIO - ratio)/2 
+        coordinate_adjust_x[0,:]-= delta
+        coordinate_adjust_x[1,:]+= delta
+    elif aspect_ratio_flag==2:
+        ratio = 1/ratio
+        delta = max_diff_x*(TARGET_RATIO - ratio)/2
+        coordinate_adjust_y[:,0]-= delta
+        coordinate_adjust_y[:,1]+= delta
+
+    return coordinate_adjust_x, coordinate_adjust_y
+
+
+@njit(fastmath=True)
+def aspect_ratio_exceeds_criteria(diff_x, diff_y, TARGET_RATIO=1/4):
     """
     calculates the aspect exceedence condition based on coordinate differences
 
@@ -115,17 +117,17 @@ def _aspect_ratio_exceeds_criteria(diff_x, diff_y, aspect_exceedence=1/4):
 
     aspect     = diff_x/diff_y
 
-    upper_aspect = 1/aspect_exceedence
+    upper_aspect = 1/TARGET_RATIO
 
-    if aspect > aspect_exceedence and aspect < upper_aspect:
+    if aspect > TARGET_RATIO and aspect < upper_aspect:
         return 0
-    elif aspect < aspect_exceedence:
+    elif aspect < TARGET_RATIO:
         return 1
     else:
         return 2
 
-@njit
-def _determine_interpolate_mode(coordinate_array, sample_spacing=10_000,cutoff_number=350):
+@njit(fastmath=True)
+def determine_interpolate_mode(coordinate_array, sample_spacing=10_000,cutoff_number=350):
     """
     determines the number of interpolation points based on provided sample spacing.
     divides the max coordinate difference by a sample spacing.
@@ -149,7 +151,7 @@ def _determine_interpolate_mode(coordinate_array, sample_spacing=10_000,cutoff_n
         number of samples needed to sample along that dimension.
     """
 
-    max_diff = _get_max_coordinate_diff(coordinate_array)
+    max_diff = get_max_coordinate_diff(coordinate_array)
 
     samples_needed = max_diff//sample_spacing
     if samples_needed < 3:
@@ -159,8 +161,8 @@ def _determine_interpolate_mode(coordinate_array, sample_spacing=10_000,cutoff_n
 
     return samples_needed
 
-@njit
-def _get_max_coordinate_diff(coordinate_array):
+@njit(fastmath=True)
+def get_max_coordinate_diff(coordinate_array):
     """
     given a 2d numpy array, finds the max difference between elements of the array
     """
@@ -173,8 +175,8 @@ def _get_max_coordinate_diff(coordinate_array):
     max_diff = max([abs(x3-x0),abs(x3-x1),abs(x3-x2),abs(x2-x0),abs(x2-x1),abs(x1-x0)])
     return max_diff
 
-@njit
-def _patch_is_rectangular_check(initial_x_patch, initial_y_patch):
+@njit(fastmath=True)
+def patch_is_rectangular(initial_x_patch, initial_y_patch):
     """
     determines if the patch coordinates are square
 

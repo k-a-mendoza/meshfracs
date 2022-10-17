@@ -1,0 +1,12 @@
+setup.py
+meshfracs/__init__.py
+meshfracs/alphadecay.py
+meshfracs/aspect.py
+meshfracs/calculate_bulk_fractions.py
+meshfracs/dataaccess.py
+meshfracs/datainterp.py
+meshfracs/volumefractions.py
+meshfracs.egg-info/PKG-INFO
+meshfracs.egg-info/SOURCES.txt
+meshfracs.egg-info/dependency_links.txt
+meshfracs.egg-info/top_level.txt

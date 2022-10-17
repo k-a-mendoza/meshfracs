@@ -5,7 +5,7 @@ sys.path.append(os.path.join('/home','kmendoza','Desktop','EGI UTILITIES','egi_u
 sys.path.append(os.path.join('/home','kmendoza','Desktop','EGI UTILITIES'))
 import time
 import numpy as np
-from ..meshfracs import aspect
+from meshfracs import aspect
 _patch_is_rectangular          = aspect.patch_is_rectangular
 _aspect_ratio_exceeds_criteria = aspect.aspect_ratio_exceeds_criteria
 _get_max_coordinate_diff       = aspect.get_max_coordinate_diff

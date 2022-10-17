@@ -1,6 +1,6 @@
 
 import numpy as np
-from numba import jit, njit
+from numba import njit
 
 @njit
 def decay_data_patch(alpha, data_patch, average_value=-4e3):
@@ -112,10 +112,10 @@ def get_l1norm_alpha(x_surface,y_surface,x0=-4e6,x1=-2.6e6,x2=2.6e6,x3=4e6,
     alpha_y = np.ones(x_length.shape)
 
     zero_mask = (x_length < x0) | (x_length > x3) | (y_length < y0) | (y_length > y3)
-    ramp_x_positive = (x_length > x0) | (x_length < x1)
-    ramp_x_negative = (x_length > x2) | (x_length < x3)
-    ramp_y_positive = (y_length > y0) | (y_length < y1)
-    ramp_y_negative = (y_length > y2) | (y_length < y3)
+    ramp_x_positive = (x_length > x0) & (x_length < x1)
+    ramp_x_negative = (x_length > x2) & (x_length < x3)
+    ramp_y_positive = (y_length > y0) & (y_length < y1)
+    ramp_y_negative = (y_length > y2) & (y_length < y3)
 
     alpha_x[ramp_x_positive] = (x_length[ramp_x_positive]     - x0)/(x1-x0)
     alpha_x[ramp_x_negative] = 1 - (x_length[ramp_x_negative] - x2)/(x3-x2)
@@ -124,5 +124,5 @@ def get_l1norm_alpha(x_surface,y_surface,x0=-4e6,x1=-2.6e6,x2=2.6e6,x3=4e6,
 
     alpha = alpha_x*alpha_y
     alpha[zero_mask]=0
-
+    alpha = alpha.reshape(x_surface.shape)
     return alpha

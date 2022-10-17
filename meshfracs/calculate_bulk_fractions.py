@@ -1,21 +1,22 @@
-import warnings
-warnings.filterwarnings("ignore")
-import sys
+#import warnings
+#warnings.filterwarnings("ignore")
 import os
+from re import X
 import numpy as np
 import egi_utils.meshing as meshing
 import geopandas as gpd
 from pyproj import Proj, transform
-from numba import jit, njit
 import tqdm
+from .patchcompute import compute_patches, compute_ratios, compute_aspect_correction_x, compute_aspect_correction_y
 import multiprocessing as mp
 from multiprocessing import RawArray
-import aspect
-from dataaccess import GrayverData, ElevationPatch, Coastlines
-from datainterp import Regridder
-import alphadecay as adecay
-import volumefractions
-subfolder_extensions = ('solid_fraction','sediment_fraction','ocean_conductivity','sediment_conductivity')
+from .dataaccess import GrayverInterpolatorFactory, ElevationSplineFactory
+
+from .workerbalance import create_worker_patches
+import time
+subfolder_extensions = ('solid_fraction','sediment_fraction','ocean_conductivity',
+                        'sediment_conductivity','ratio_map','aspect_map_x-','aspect_map_x+',
+                        'aspect_map_y-','aspect_map_y+')
 var_dict = {}
 
 def projection_definitions():
@@ -67,69 +68,6 @@ def return_memory_views_of_arrays(x_array,y_array,z_array):
 
     return X, Y, Z
 
-# A global dictionary storing the variables passed from the initializer.
-@jit
-def patchwise_compute(sed_thickness,
-                      sed_conductivity,
-                      ocean_conductivity,
-                      topography,
-                      coastline,
-                       x_grid, y_grid, z_grid):
-   
-    regridder = Regridder()
-    shape2d   = x_grid.shape
-    shape3d   = z_grid.shape
-
-    solid_frac_xyz    = np.ones(shape3d)
-    sediment_frac_xyz = np.zeros(shape3d) 
-
-    ocean_conductivity_xy    = np.zeros(shape2d)
-    sediment_conductivity_xy = np.zeros(shape2d)
-
-    for ix in range(shape2d[0]):
-        for iy in range(shape2d[1]):
-            x_cell = x_grid[ix:ix+2,iy:iy+2]
-            y_cell = y_grid[ix:ix+2,iy:iy+2]
-            z_column = -z_grid[ix:ix+2,iy:iy+2,:]
-            corrected_aeqd_patch_x, corrected_aeqd_patch_y = aspect.correct_patch_aspect(x_cell,
-                                                                                         y_cell)
-
-
-            new_x_surface, new_y_surface = regridder.get_new_coordinates(corrected_aeqd_patch_x,
-                                                                        corrected_aeqd_patch_y)
-
-            alpha      = adecay.get_l1norm_alpha(new_x_surface,new_y_surface)
-
-            topo_patch = topography.get_values(new_x_surface,new_y_surface)
-            topo_patch = adecay.decay_data_patch(alpha,topo_patch,average_value=-5e3)
-
-            sed_topo   = sed_thickness.get_sediment_thickness(new_x_surface,new_y_surface)
-            sed_topo   = adecay.decay_data_patch(alpha,sed_topo,average_value=0)
-
-            sed_cond   = sed_conductivity.get_sediment_conductivity(new_x_surface,new_y_surface)
-            sed_cond   = adecay.decay_data_patch(alpha,sed_cond,average_value=adecay.average)
-
-            ocean_patch = ocean_conductivity.get_ocean_conductivity(new_x_surface,new_y_surface)
-            ocean_patch = adecay.decay_data_patch(alpha,ocean_patch,average_value=ocean_conductivity.average)
-
-            boolean_in_land = coastline.identify_land_points(new_x_surface, new_y_surface)
-            topo_patch[boolean_in_land==1]=0
-
-            # step 1, calculate volume fractions
-            solid_frac_column, sediment_frac_column = volumefractions.get_score_for_column(z_column, 
-                                                                new_x_surface, new_y_surface, 
-                                                                topo_patch, sed_topo)
-            # step 2, calculate surface fractions
-            ocean_conductivity_xy[ix,iy]= np.mean(ocean_patch)
-            sediment_conductivity_xy[ix,iy]= np.mean(sed_cond)
-
-
-            z_depth = len(solid_frac_column)
-            solid_frac_xyz[ix,iy,:z_depth]    = solid_frac_column
-            sediment_frac_xyz[ix,iy,:z_depth] = sediment_frac_column
-
-    return solid_frac_xyz, sediment_frac_xyz, ocean_conductivity_xy, sediment_conductivity_xy
-
 def compute_code_grid(args):
     """
     for every provided ix and iy index, calculates
@@ -157,55 +95,108 @@ def compute_code_grid(args):
 
 
     """
-
     x_grid = np.frombuffer(var_dict['x_grid']).reshape(var_dict['shape2d'])
     y_grid = np.frombuffer(var_dict['y_grid']).reshape(var_dict['shape2d'])
     z_grid = np.frombuffer(var_dict['z_grid']).reshape(var_dict['shape3d'])
     output_dirs = var_dict['output_dirs']
-
+    debug_mode  = var_dict['debug']
+    compute_mode = var_dict['compute_mode']
 
     (x_patch, y_patch) = args[0]
     ix0 = x_patch[0]
     ix1 = x_patch[1]
     iy0 = y_patch[0]
     iy1 = y_patch[1]
+    idx = ix1-ix0
+    idy = iy1-iy0
 
-    grayver_data   = args[1]
-    elevation_data = args[2]
-    coastline_data = args[3]
+    grayver_data_factory   = args[1]
+    elevation_factory      = args[2]
 
-    x_domain = np.copy(x_grid[ix0:ix1,iy0:iy1])
-    y_domain = np.copy(y_grid[ix0:ix1,iy0:iy1])
-    z_domain = np.copy(z_grid[ix0:ix1,iy0:iy1,:])
+    x_domain = np.copy(x_grid[ix0:ix1+2,iy0:iy1+2])
+    y_domain = np.copy(y_grid[ix0:ix1+2,iy0:iy1+2])
+    z_domain = np.copy(z_grid[ix0:ix1+2,iy0:iy1+2,:])
+    if compute_mode =='default':
+        default_compute(output_dirs, debug_mode, ix0, ix1, iy0, iy1, idx, idy, 
+                    grayver_data_factory, elevation_factory, x_domain, y_domain, z_domain)
+    elif compute_mode =='ratios':
+        ratio_compute(output_dirs, ix0, ix1, iy0, iy1, idx, idy, x_domain, y_domain)
+    elif compute_mode =='aspect':
+        aspect_correction_compute(output_dirs, ix0, ix1, iy0, iy1, idx, idy, x_domain, y_domain)
+    return None
 
-    sediment_thickness_interpolator = grayver_data.get_interpolator(type='sediment thickness',
-                                      x_interp_grid=x_domain,
-                                      y_interp_grid=y_domain)
-    sediment_conductivity_interpolator = grayver_data.get_interpolator(type='sediment conductivity',
-                                         x_interp_grid=x_domain,
-                                         y_interp_grid=y_domain)
-    ocean_conductivity_interpolator = grayver_data.get_interpolator(type='ocean conductivity',
-                                         x_interp_grid=x_domain,
-                                         y_interp_grid=y_domain)
-    elevation_interpolator = elevation_data.get_elevation_interpolator(x_domain, y_domain)
+def default_compute(output_dirs, debug_mode, ix0, ix1, iy0, iy1, idx, idy, grayver_data_factory, 
+                    elevation_factory, x_domain, y_domain, z_domain):
 
-    solid_frac, sediment_frac, ocean_conductivity, sediment_conductivity = patchwise_compute(\
+    if debug_mode:
+        timing_dict = {
+            'data access objects':0,
+            'patch calculation':0,
+            'array saving':0
+            }
+        t0 = time.perf_counter()
+
+    sediment_thickness_interpolator = grayver_data_factory.get_interpolator(type='sediment thickness',
+                                      x_points=x_domain,
+                                      y_points=y_domain)
+    sediment_conductivity_interpolator = grayver_data_factory.get_interpolator(type='sediment conductivity',
+                                      x_points=x_domain,
+                                      y_points=y_domain)
+    ocean_conductivity_interpolator = grayver_data_factory.get_interpolator(type='ocean conductivity',
+                                      x_points=x_domain,
+                                      y_points=y_domain)
+
+    elevation_interpolator = elevation_factory.get_interpolator(x_domain, y_domain)
+
+    if debug_mode:
+        dt = time.perf_counter()-t0
+        timing_dict['data access objects']+=dt
+        t0 = time.perf_counter() 
+
+    solid_frac, sediment_frac, ocean_conductivity, sediment_conductivity = compute_patches(\
                                 sediment_thickness_interpolator,
                                 sediment_conductivity_interpolator,
                                 ocean_conductivity_interpolator,
-                                elevation_interpolator, coastline_data,
-                                x_domain, y_domain, z_domain)
+                                elevation_interpolator,
+                                x_domain, y_domain, z_domain,debug_mode)
+    solid_frac            = solid_frac[:idx,:idy,:]
+    sediment_frac         = sediment_frac[:idx,:idy,:]
+    ocean_conductivity    = ocean_conductivity[:idx,:idy]
+    sediment_conductivity = sediment_conductivity[:idx,:idy]
+    if debug_mode:
+        dt = time.perf_counter()-t0
+        timing_dict['patch calculation']+=dt
+        t0 = time.perf_counter()
 
     index_string = f'{ix0}:{ix1}_{iy0}:{iy1}'
+    
     np.save(f'{output_dirs["solid_fraction"]}{os.sep}{index_string}_solidfraction',solid_frac)
     np.save(f'{output_dirs["sediment_fraction"]}{os.sep}{index_string}_sedimentfraction',sediment_frac)
     np.save(f'{output_dirs["ocean_conductivity"]}{os.sep}{index_string}_oceanconductivity',ocean_conductivity)
     np.save(f'{output_dirs["sediment_conductivity"]}{os.sep}{index_string}_sedimentconductivity',sediment_conductivity)
+    if debug_mode:
+        dt = time.perf_counter()-t0
+        timing_dict['array saving']+=dt
+        print('total time (s) per operation\n')
+        for key, value in timing_dict.items():
+            print(f"\t {key}:{value}")
 
-    return None
+def ratio_compute(output_dirs, ix0, ix1, iy0, iy1, idx, idy, x_domain, y_domain):
 
+    patch_ratio = compute_ratios(x_domain, y_domain)[:idx,:idy]
+    index_string = f'{ix0}:{ix1}_{iy0}:{iy1}'
+    np.save(f'{output_dirs["ratio_map"]}{os.sep}{index_string}_ratios',patch_ratio)
 
-def init_worker(X,Y,Z, shape2d, shape3d, output_dirs):
+def aspect_correction_compute(output_dirs, ix0, ix1, iy0, iy1, idx, idy, x_domain, y_domain):
+    index_string = f'{ix0}:{ix1}_{iy0}:{iy1}'
+    x_minus, x_plus = compute_aspect_correction_x(x_domain, y_domain)
+    y_minus, y_plus = compute_aspect_correction_y(x_domain, y_domain)
+    np.save(f'{output_dirs["aspect_map_x-"]}{os.sep}{index_string}_x-',x_minus[:idx,:idy])
+    np.save(f'{output_dirs["aspect_map_x+"]}{os.sep}{index_string}_x+',x_plus[:idx,:idy])
+    np.save(f'{output_dirs["aspect_map_y-"]}{os.sep}{index_string}_y-',y_minus[:idx,:idy])
+    np.save(f'{output_dirs["aspect_map_y+"]}{os.sep}{index_string}_y+',y_plus[:idx,:idy])
+
+def init_worker(X,Y,Z, shape2d, shape3d, output_dirs, debug,compute_mode):
     # Using a dictionary is not strictly necessary. You can also
     # use global variables.
     var_dict['x_grid'] = X
@@ -214,44 +205,33 @@ def init_worker(X,Y,Z, shape2d, shape3d, output_dirs):
     var_dict['shape2d'] = shape2d
     var_dict['shape3d'] = shape3d
     var_dict['output_dirs'] = output_dirs
+    var_dict['debug']=debug
+    var_dict['compute_mode']=compute_mode
 
-def prepare_code_grid(directory_strings):
+def prepare_code_grid(directory_strings, debug_mode=False, worker_div_multiplier=1, worker_count=46,
+                      compute_mode='default'):
     """
-    This algorithm assigns parameter codes to the mesh
-
-    Codes are as follows:
-
-    0: land parameter
-    1-8: possible sea parameters. 1 indicates a cell is 1/8th in the ocean,
-        whereas 8 indicates it is wholly in the ocean.
-    9: air
-    10: background
-    11: edge. Edge nodes occupy the last index plane in every direction
-
-
-    Codes are assigned to the South, West, top node index.
+    Initializes memory buffer and launches workers to calculate % Earth, % sediment within the Earth,
+    avg sediment conductivity and avg seawater conductivity per cell. 
 
 
     """
 
-    mesh_directory      = directory_strings['mesh_dir']
+    mesh_directory      = directory_strings['mesh_directory']
     elevation_directory = directory_strings['elevation_directory']
-    shoreline_gpd       = get_na_shapefile(directory_strings['shoreline_shp'])
     output_dirs         = directory_strings['output_dirs']
-    grayver_dir         = directory_strings['grayver_dir']
+    conductance_file    = directory_strings['conductance_file']
     
-    print('loading mesh')
+    print(f'loading mesh: {mesh_directory}')
+    print(f'current working directory is {os.getcwd()}')
     mesh = meshing.MeshFromFile()
     mesh.load(mesh_directory,type='npy')
     print('creating iterable arguments')
-    worker_count = 46
     gebco_data          = elevation_directory
     projection          = projection_definitions()['azimuth_equid']
-    projection_func     = convert_lonlat_into_aeqd
 
-    surface_index  = np.argwhere(np.squeeze(mesh.z_grid[0,0,:])==0)
-    z_domain_limit = np.argmax(np.squeeze(mesh.z_grid[0,0,:])<30_000)
-
+    surface_index  = np.argwhere(np.squeeze(mesh.z_grid[0,0,:])==0)[0][0]
+    z_domain_limit = np.argmax(np.squeeze(mesh.z_grid[0,0,:])>30_000)
     x_array = mesh.x_grid[:,:,0]
     y_array = mesh.y_grid[:,:,0]
     z_array = mesh.z_grid[:,:,surface_index:z_domain_limit]
@@ -259,57 +239,73 @@ def prepare_code_grid(directory_strings):
     d2_grid_shape = x_array.shape
     d3_grid_shape = z_array.shape
 
-    x_array_length = list(range(x_array.shape[0]))
-    y_array_length = list(range(x_array.shape[1]))
-
-    worker_count_2 = int(np.floor(np.sqrt(2*worker_count)))
-    x_divisions = np.array_split(x_array_length, worker_count_2)
-    x_division_limits = [(np.amin(x),np.amax(x)+1) for x in x_divisions]
-    y_divisions = np.array_split(y_array_length, worker_count_2)
-    y_division_limits = [(np.amin(x),np.amax(x)+1) for x in y_divisions]
-
+    iterable_indices = create_worker_patches(worker_div_multiplier, worker_count, d2_grid_shape, x_array, y_array)
+    
     iterable_arguments = []
-
-    for x_patch, y_patch in zip(x_division_limits, y_division_limits):
-        iterable_arguments.append(
-            (x_patch,y_patch),
-            GrayverData(projection_func, path=grayver_dir),
-            ElevationPatch(gebco_data, projection),
-            Coastlines(shoreline_gpd, projection)
-        )
-
+    for indices in iterable_indices:
+        iterable_arguments.append((indices,
+                GrayverInterpolatorFactory(projection, file=conductance_file),
+                ElevationSplineFactory(gebco_data, projection)))
+            
     print('creating shared variables')
     x_buffer, y_buffer, z_buffer = return_memory_views_of_arrays(x_array,y_array,z_array)
 
-    print(f'launching {worker_count} workers')
-    init_args = (x_buffer, y_buffer, z_buffer, d2_grid_shape, d3_grid_shape, output_dirs)
-    with mp.Pool(worker_count, initializer=init_worker, initargs=init_args) as p:
-        list(tqdm.tqdm(p.imap(compute_code_grid,args),
-                       total=len(args),
+    init_args = (x_buffer, y_buffer, z_buffer, d2_grid_shape, d3_grid_shape, output_dirs, debug_mode, compute_mode)
+
+    if debug_mode:
+        init_worker(*init_args)
+        compute_code_grid(iterable_arguments[0])
+        return None
+    else:
+        print(f'launching {worker_count} workers')
+        with mp.Pool(worker_count, initializer=init_worker, initargs=init_args) as p:
+            list(tqdm.tqdm(p.imap(compute_code_grid,iterable_arguments),
+                       total=len(iterable_arguments),
                        bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}',smoothing=0))
 
 
-if __name__ == '__main__':
-    args = sys.argsv[:]
+
+def calculate_conductivity(mesh_file, gebco_dir, conductance_file, working_dir, 
+                            debug_mode=False,worker_div_multiplier=1,worker_count = 46,compute_mode='default'):
+    """
+    performs conductivity calculations using the provided files
+
+    Parameters
+    ==========
+
+    mesh_file : str
+        .npy file of the mesh to perform calculations on. This assumes the mesh file x direction
+    is oriented in geographic coordinates (x is E-W, y is N-S)
+
+    gebco_dir : str
+        the directory containing the tiles to use for bathymetry data retrieval
+
+    conductance_file : str
+        the file containing world conductance data
+
+    debug_mode : bool [optional] 
+        whether to run the calculation in debug mode. In debug mode, the calculation is single threaded. 
+    Debug mode also results in relative run times being calculated and printed to terminal for every major
+    preprocessing operation.
+
+    Returns
+    =======
+    None
+    
+    
+    """
     #first arg should be target mesh file
     # second arg should be target
-    mesh_dir       = args[0]
-    gebco_dir      = args[1]
-    land_shape_dir = args[2]
-    grayver_dir    = args[3]
-    #'shoreline/edited_shoreline_us_III.shp'
-    mesh_name = mesh_dir.split(os.sep)[-1]
-    cwd = os.getcwd()
+    mesh_name = mesh_file.split(os.sep)[-1].split('.')[0]
     directory_strings = {
-        'mesh_directory':mesh_dir,
+        'mesh_directory':mesh_file,
         'elevation_directory':gebco_dir,
-        'shoreline_shp':land_shape_dir,
-        'grayver_dir':grayver_dir,
+        'conductance_file':conductance_file,
         'mesh_name':mesh_name,
         'output_dirs':{}
     }
 
-    output_folder=f'{cwd}{os.sep}{mesh_name}_conductivity_data'
+    output_folder=f'{working_dir}{os.sep}{mesh_name}_conductivity'
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     for extension in subfolder_extensions:
@@ -318,4 +314,5 @@ if __name__ == '__main__':
         if not os.path.exists(new_path):
             os.makedirs(new_path)
 
-    prepare_code_grid(directory_strings)
+    prepare_code_grid(directory_strings,debug_mode=debug_mode,
+                    worker_div_multiplier=worker_div_multiplier, worker_count=worker_count,compute_mode=compute_mode)

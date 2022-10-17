@@ -1,155 +1,126 @@
 import numpy as np
 from numba import jit, njit
 
-from datainterp import Regridder
-def calculate_volume_fractions(regridder, bathymetry, sediment, z_grid, ix, iy):
+from .datainterp import interpolate_new_surface
+
+@njit(fastmath=True)
+def get_lowest_index(elevation_grid, sediment_thickness, z_array):
+    deepest_point   = np.amin(elevation_grid-sediment_thickness)
+    target_index    = 0
+    for iz in range(z_array.shape[2]):
+        z_min = np.amin(z_array[:,:,iz])
+        diff = deepest_point-z_min
+        if diff < 0:
+            target_index = iz
+    return target_index
+
+@njit(fastmath=True)
+def get_score_for_column(z_cell, square_xx, square_yy, topo_patch, sed_topo):
     """
-    This function calculates volume fractions for each cell in the mesh.
+    calculates the % solid and sediment at each index within an earth column
 
     Parameters
     ==========
 
-    regridder : Regridder
-        a regridder object which is used to subdivide a spatial domain
+    z_cell : np.ndarray
+        a 2 x 2 x l array specifying the cell corner depths
 
-    bathymetry : np.ndarray
-        a 2d array of dimensions 8x8 representing the bathymetric depth over a region as provided by GEBCO.
-        bathymetry may be positive or negative and is in coordinates of meters z
+    x_cell : np.ndarray
+        a  2x2 array specifying the cell corner x coordinates
 
-    sediment : np.ndarray
-        a 2d array of dimensions 8x8 representing the sediment depth over a region. sediment ranges from
-        [0,n] where n is the maximum thickness of sediment in the dataset.
+    y_cell : np.ndarray
+        a 2x2 array specifying the cell corner y coordinates
 
-    z_grid : np.ndarray:
-        a 2x2xn array representing the z coordinates of the mesh. ix and iy indexes represent the [0,0,:] coordinate
-        of the grid
-
-    ix : int
-        the x index of the intended calculation
-    iy : int
-        the y index of the intended calculation
-
-    Returns
-    =======
-
-    calculations_ignored : bool
-        True when the sediment+bathymetry is entirely above the provided elevation patch. False if not.
-
-    """
-
-    lowest_index  = get_lowest_index(bathymetry-sediment, z_grid)
-    if lowest_index==0:
-        return True
-    z_column      = z_grid[:,:,:lowest_index+3]
-
-    solid_percent, sediment_percent = get_score_for_column(z_column,  bathymetry,
-                                                           sediment, lowest_index, regridder)
-
-
-    return False
-
-
-@jit
-def get_score_for_column(z_column, x_grid, y_grid, topo_patch, sed_topo, regridder: Regridder):
-    """
-    calculates sediment fraction and solid fraction for each cell in z_column. routine is unneccesarily verbose for
-    performance reasons.
-
-    Parameters
-    ==========
-    z_column : np.ndarray
-        a 2x2x8 array of elevations representing the mesh depths
-    bath_patch:
-        an 8x8 array of elevations representing the bathymetric+topographic surface within the 2x2 cell
-    sediment:
-        an 8x8 array of sediment thicknesses representing the bathymetric surface within the 2x2 cell
-    lowest_index : int
-        the lowest integer along the z axis in which to perform this operation
-    regridder: Regridder
-        a regridder object
+    x_grid : np.ndarray
+        a nxm array specifying x coordinate locations to evaluate the solid and sediment fractions
+        on
+    y_grid : np.ndarray
+        a nxm array specifying y coordinate locations to evaluate the solid and sediment fractions
+        on
+    topo_patch : np.ndarray
+        an nxm array specifying the z elevation of topography at the x and y grid coordinates
+    sed_patch : np.ndarray
+        an nxm array specifying the z thickness of sediment at the x and y grid coordinates
 
     Returns
     =======
-    solid_percent_column: np.ndarray
-        a 1-d array representing the solid fraction of the cell at every depth
-    sediment_percent_column: np.ndarray
-        a 1-d array representing the sediment fraction of the cell at every depth
-
+    (solid_array, sediment_array) : tuple of npdarrays
+        each returned array is of length l
+    
+    
     """
     FLOAT_PRECISION = 1e-4
+    bottomost_z_index        = get_lowest_index(topo_patch, sed_topo, z_cell)
+    column_depth             = z_cell.shape[2]
+    solid_percent_column     = np.ones(column_depth)
+    sediment_percent_column  = np.zeros(column_depth)
 
-    bottomost_z_index = get_lowest_index(topo_patch, sed_topo, z_column)
+    below_sealevel    = np.any(topo_patch<0) # perform solid frac if True if any below sea level
+    nonzero_sediment  = np.any(sed_topo>FLOAT_PRECISION)
     
-    below_sealevel    = np.any(topo_patch<0) #True if totally above sea level
-    nonzero_sediment  = np.any(np.abs(sed_topo)>FLOAT_PRECISION)
-
-    solid_percent_column, sediment_percent_column =_calculate_column_scores(z_column, x_grid, y_grid, bottomost_z_index, topo_patch, sed_topo, regridder,
-                             evaluate_solid_percent= below_sealevel, evaluate_sediment_percent=nonzero_sediment)
-
-    
-    return solid_percent_column, sediment_percent_column
-
-@njit
-def _calculate_column_scores(z_column, x_grid, y_grid, bottomost_z_index, topo_patch, sed_topo, regridder,
-                             evaluate_solid_percent=True, evaluate_sediment_percent=True):
-    solid_percent_column     = np.ones(bottomost_z_index)
-    sediment_percent_column  = np.zeros(bottomost_z_index)
-    if not evaluate_sediment_percent and not evaluate_sediment_percent:
+    if not below_sealevel and not nonzero_sediment:
         return solid_percent_column, sediment_percent_column
 
-    for z_index in range(0,bottomost_z_index):
-        mesh_cube            = z_column[:,:,z_index:z_index+2]
-        regridded_mesh_cube  = regridder.get_3d_cube(mesh_cube,z_index,x_grid, y_grid)
-        solid_percent, sediment_percent  = _calculate_score(regridded_mesh_cube,
-                                                           topo_patch,
-                                                           sed_topo, evaluate_solid_percent=evaluate_solid_percent,
-                                                           evaluate_sediment_percent=evaluate_sediment_percent)
-        if evaluate_solid_percent:
-            solid_percent_column[z_index]=solid_percent
-        if evaluate_sediment_percent:
-            sediment_percent_column[z_index]=sediment_percent
+    sed_surface   = topo_patch - sed_topo
+
+    for z_index in range(bottomost_z_index):
+        mesh_cube_z = z_cell[:,:,z_index:z_index+2]
+        
+        z_upper_surface = interpolate_new_surface(mesh_cube_z[:,:,0], square_xx, square_yy)
+        z_lower_surface = interpolate_new_surface(mesh_cube_z[:,:,1], square_xx, square_yy)
+
+        topo_zeroed   = topo_patch      - z_lower_surface 
+        sed_zeroed    = sed_surface     - z_lower_surface 
+        delta_z       = z_upper_surface - z_lower_surface
+
+        topo_zeroed=_lthan2d(topo_zeroed,0.0,0.0)
+
+        if np.all(sed_surface>=z_upper_surface):
+            solid_intermediate  = 1.0
+            sed_intermediate    = 0.0
+        else:
+            if np.all(topo_patch>z_upper_surface):
+                solid_intermediate  = 1.0
+            else:
+                solid_intermediate = topo_zeroed/delta_z
+                solid_intermediate = _lthan2d(solid_intermediate,0.0,0.0)
+                solid_intermediate = _gthan2d(solid_intermediate,1.0,1.0)
+                solid_intermediate = np.mean(solid_intermediate)
+
+            if nonzero_sediment:
+                sed_intermediate = 1-sed_zeroed/delta_z
+                sed_intermediate = _lthan2d(sed_intermediate,0.0,0.0)
+                sed_intermediate = _gthan2d(sed_intermediate,1.0,1.0)
+                sed_intermediate = np.mean(sed_intermediate)
+            else:
+                sed_intermediate=0.0
+
+        sed_intermediate+=(solid_intermediate-1)
+        if sed_intermediate<0:
+            sed_intermediate=0
+        solid_percent_column[z_index]    = solid_intermediate
+        sediment_percent_column[z_index] = sed_intermediate
 
     return solid_percent_column, sediment_percent_column
 
-@njit
-def _calculate_score(regridded_mesh_cube, topo_patch, sed_topo, 
-                     evaluate_solid_percent=True, evaluate_sediment_percent=True):
-    shape3d = regridded_mesh_cube.shape
-    total_dim = np.prod(shape3d)
-    solid_percent    = 0
-    sediment_percent = 0
 
-    for i in range(shape3d[2]):
-        z_slice = regridded_mesh_cube[:,:,i]
-        if evaluate_solid_percent and not evaluate_sediment_percent:
-            solid_percent    += (z_slice<topo_patch).sum()
+@njit(fastmath=True)
+def _gthan2d(array,cutoff,assignment):
+    shape = array.shape
+    for ix in range(shape[0]):
+        for iy in range(shape[1]):
+            if array[ix,iy]>cutoff:
+                array[ix,iy]=assignment
+    return array
 
-        elif not evaluate_solid_percent and evaluate_sediment_percent:
 
-            sediment_percent += (z_slice>sed_topo).sum()
-        else:
-            below_bathymetry  = z_slice<topo_patch
-            above_sediment    = z_slice>sed_topo
-
-            solid_percent    += (below_bathymetry).sum()
-            sediment_percent += ( above_sediment & below_bathymetry).sum()
-
-    solid_percent    = solid_percent/total_dim
-    sediment_percent = sediment_percent/total_dim
-
-    return solid_percent, sediment_percent
-
-@njit
-def get_lowest_index(elevation_grid, sediment_thickness, z_array):
-    minz_across_xy  = np.min(np.min(z_array,axis=0),axis=0)
-    deepest_point   = np.amin(elevation_grid-sediment_thickness)
-    deepest_diffs   = deepest_point - minz_across_xy
-    smallest_positive_diff = 1000000.0
-    for diff in deepest_diffs:
-        if diff > 0 and diff < smallest_positive_diff:
-            smallest_positive_diff = diff
-    iz = np.argwhere(deepest_diffs==smallest_positive_diff)
-    return iz
-
+@njit(fastmath=True)
+def _lthan2d(array,cutoff,assignment):
+    shape = array.shape
+    for ix in range(shape[0]):
+        for iy in range(shape[1]):
+            if array[ix,iy]<cutoff:
+                array[ix,iy]=assignment
+    return array
 
 
